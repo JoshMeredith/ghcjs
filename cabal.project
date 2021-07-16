@@ -1,6 +1,7 @@
 
 packages: ghcjs.cabal
           lib/ghcjs-th/*.cabal
+	  ghcjs-ld/ghcjs-ld.cabal
 
 allow-newer: unliftio-core:base,
              parallel:base,
