@@ -1,5 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ApplicativeDo #-}
 
 module Main where
 
@@ -10,6 +13,10 @@ import Compiler.Settings
 
 import DynFlags
 import Util
+
+import Options.Applicative
+
+import Control.Monad.Reader
 
 import           Control.Monad.State.Strict
 
@@ -40,7 +47,7 @@ import Data.Char (chr)
 
 import Compiler.JMacro.Combinators
 
-import Control.Lens hiding ((#))
+import Control.Lens hiding ((#), argument)
 import Data.List
 import Data.List.Split
 
@@ -49,26 +56,55 @@ import Gen2.Utils (buildingDebug, buildingProf)
 
 import qualified Gen2.Compactor as Compactor
 import Gen2.Compactor (LinkedUnit, exprsE, exprsS, identsS, lookupRenamed, staticInfoArgs, dedupeBodies,
-                       dedupe, renameStaticInfo, renameClosureInfo, renameEntry, renameObj, collectLabels,
+                       dedupe, renameStaticInfo, renameClosureInfo,
                        encodeInfo, encodeStatic, encodeStr
                       )
 
+data LinkerSettings
+   = LinkerSettings
+   { lsDebug  :: Bool
+   , lsProf   :: Bool
+   }
+
+linkerSettings :: Parser (LinkerSettings, [FilePath])
+linkerSettings = do
+  debug  <- switch (long "debug")
+  prof   <- switch (long "prof")
+  files  <- some (argument str (metavar "file..."))
+  return $ (LinkerSettings debug prof, [])
+
+linkDebug :: Linker m => m Bool
+linkDebug = lsDebug <$> ask
+
+linkProf  :: Linker m => m Bool
+linkProf = lsProf <$> ask
+
+linkDedupe :: Linker m => m Bool
+linkDedupe = return True
+
+runLinker :: Link a -> LinkerSettings -> a
+runLinker m s = evalState (runReaderT m s) emptyCompactorState
+
+type Link = ReaderT LinkerSettings (State CompactorState)
+type Linker m = ( MonadReader LinkerSettings m
+                , MonadState CompactorState m
+                )
 
 main :: IO ()
-main = link "link-output.js" =<< getArgs
+main = do
+  (settings, files) <- execParser (info (linkerSettings <**> helper) mempty)
+  link settings "link-output.js" files
 
-link :: FilePath -> [FilePath] -> IO ()
-link output inputs = do
+link :: LinkerSettings -> FilePath -> [FilePath] -> IO ()
+link settings output inputs = do
 
   code <- forM inputs $ \input -> do
     collectCode =<< readObjectFile input
 
-  let settings = mempty
-      renamerState = emptyCompactorState
-      dflags = undefined
-      rtsDeps = S.fromList []
+  let rtsDeps = S.fromList []
 
-  let (renamerState', compacted, meta) = compact settings dflags renamerState (map funSymbol $ S.toList rtsDeps) (map (\(s,_,ci,si) -> (s,ci,si)) code)
+  let compactm = compact (map funSymbol $ S.toList rtsDeps) (map (\(s,_,ci,si) -> (s,ci,si)) code)
+      (compacted, meta) = runLinker compactm settings
       pe = TLE.encodeUtf8 . (<>"\n") . displayT . renderPretty 0.8 150 . pretty
       rendered  = parMap rdeepseq pe compacted
       renderedMeta = pe meta
@@ -77,29 +113,27 @@ link output inputs = do
   BL.writeFile output $ mconcat rendered <> renderedMeta <> renderedExports
 
   where
-    -- pkg           = depsPackage deps
-    -- mod           = depsModule deps
-    -- collectCode :: [ObjUnit] -> IO (_,_,_,_,_)
     collectCode l = let x = ( mconcat (map oiStat l)
                             , T.unlines (map oiRaw l)
                             , concatMap oiClInfo l
                             , concatMap oiStatic l)
                     in evaluate (rnf x) >> return x
 
-compact :: GhcjsSettings
-        -> DynFlags
-        -> CompactorState
-        -> [Text]
+compact :: Linker m
+        => [Text]
         -> [LinkedUnit]
-        -> (CompactorState, [JStat], JStat)
-compact settings dflags cs0 rtsDeps0 input0
+        -> m ([JStat], JStat)
+compact rtsDeps0 input0
 --  | dumpHashes' input
   =
-  let rtsDeps1 = rtsDeps0 ++
-                 map (<> "_e") rtsDeps0 ++
-                 map (<> "_con_e") rtsDeps0
-      (cs1, input1) = packStrings cs0 input0
-  in  renameInternals settings dflags cs1 rtsDeps1 input1
+  do
+    cs0 <- get
+    let rtsDeps1 = rtsDeps0 ++
+                   map (<> "_e") rtsDeps0 ++
+                   map (<> "_con_e") rtsDeps0
+        (cs1, input1) = packStrings cs0 input0
+    put cs1
+    renameInternals rtsDeps1 input1
 
 packStrings :: HasDebugCallStack
             => CompactorState
@@ -282,23 +316,25 @@ packStrings cstate code =
 
     in (cstate0, initStatic : map rewriteBlock code)
 
-renameInternals :: HasDebugCallStack
-                => GhcjsSettings
-                -> DynFlags
-                -> CompactorState
-                -> [Text]
+renameInternals :: (Linker m, HasDebugCallStack)
+                => [Text]
                 -> [LinkedUnit]
-                -> (CompactorState, [JStat], JStat)
-renameInternals _settings _dflags cs0 rtsDeps stats0a = (cs, stats, meta)
+                -> m ([JStat], JStat)
+renameInternals rtsDeps stats0a = do
+  ddupe <- linkDedupe
+  let (stbs, stats0) = (if ddupe
+                        then dedupeBodies rtsDeps . dedupe rtsDeps
+                        else (mempty,)) stats0a
+  renamed stbs stats0 <$> linkProf <*> linkDebug >>= id
   where
-    (stbs, stats0) = (if True -- gsDedupe settings
-                      then dedupeBodies rtsDeps . dedupe rtsDeps
-                      else (mempty,)) stats0a
-    ((stats, meta), cs) = runState renamed cs0
-    renamed :: State CompactorState ([JStat], JStat)
-    renamed
-      | True = do
-      -- | buildingDebug dflags || buildingProf dflags = do
+    renamed :: MonadState CompactorState m
+            => JStat
+            -> [(JStat, [ClosureInfo], [StaticInfo])]
+            -> Bool
+            -> Bool
+            -> m ([JStat], JStat)
+    renamed stbs stats0 prof debug
+      | prof || debug = do
         cs <- get
         let renamedStats = map (\(s,_,_) -> s & identsS %~ lookupRenamed cs)
                                stats0
@@ -309,7 +345,7 @@ renameInternals _settings _dflags cs0 rtsDeps stats0a = (cs, stats, meta)
             -- render metadata as individual statements
             meta = mconcat (map staticDeclStat statics) <>
                    (stbs & identsS %~ lookupRenamed cs) <>
-                   mconcat (map (staticInitStat $ True {-buildingProf dflags-}) statics) <>
+                   mconcat (map (staticInitStat $ prof) statics) <>
                    mconcat (map (closureInfoStat True) infos)
         return (renamedStats, meta)
       | otherwise = do
@@ -368,88 +404,79 @@ renameInternals _settings _dflags cs0 rtsDeps stats0a = (cs, stats, meta)
                      |] -}
         return (renamedStats, meta)
 
--- renderLinker :: GhcjsSettings
---              -> DynFlags
---              -> CompactorState
---              -> Set Fun
---              -> [(Package, Module, JStat, Text, [ClosureInfo], [StaticInfo], [ForeignRef])] -- ^ linked code per module
---              -> (BL.ByteString, Int64, CompactorState, LinkerStats)
--- renderLinker settings dflags renamerState rtsDeps code =
---   let (renamerState', compacted, meta) = Compactor.compact settings dflags renamerState (map funSymbol $ S.toList rtsDeps) (map (\(_,_,s,_,ci,si,_) -> (s,ci,si)) code)
---       pe = TLE.encodeUtf8 . (<>"\n") . displayT . renderPretty 0.8 150 . pretty
---       rendered  = parMap rdeepseq pe compacted
---       renderedMeta = pe meta
---       renderedExports = TLE.encodeUtf8 . TL.fromStrict . T.unlines . filter (not . T.null) $ map (\(_,_,_,rs,_,_,_) -> rs) code
---       mkStat (p,m,_,_,_,_,_) b = ((p,m), BL.length b)
---   in ( mconcat rendered <> renderedMeta <> renderedExports
---      , BL.length renderedMeta
---      , renamerState'
---      , M.fromList $ zipWith mkStat code rendered
---      )
+renameObj :: MonadState CompactorState m
+          => Text
+          -> m Text
+renameObj xs = do
+  (TxtI xs') <- renameVar (TxtI xs)
+  addItem statics statics numStatics numStatics parentStatics xs'
+  return xs'
 
--- collectDeps :: DynFlags
---             -> Map (Package, Module) (Deps, DepsLocation)
---             -> [InstalledUnitId]     -- ^ packages, code linked in this order
---             -> Set LinkableUnit -- ^ do not include these
---             -> Set Fun -- ^ roots
---             -> [LinkableUnit] -- ^ more roots
---             -> IO ( Set LinkableUnit
---                   , [(Package, Module, JStat, Text, [ClosureInfo], [StaticInfo], [ForeignRef])]
---                   )
--- collectDeps _dflags lookup packages base roots units = do
---   allDeps <- getDeps (fmap fst lookup) base roots units
---   -- read ghc-prim first, since we depend on that for static initialization
---   let packages' = uncurry (++) $ partition (==(toInstalledUnitId primUnitId)) (nub packages)
---       unitsByModule :: Map (Package, Module) IntSet
---       unitsByModule = M.fromListWith IS.union $
---                       map (\(p,m,n) -> ((p,m),IS.singleton n)) (S.toList allDeps)
---       lookupByPkg :: Map Package [(Deps, DepsLocation)]
---       lookupByPkg = M.fromListWith (++) (map (\((p,_m),v) -> (p,[v])) (M.toList lookup))
---   code <- fmap (catMaybes . concat) . forM packages' $ \pkg ->
---     mapM (uncurry $ extractDeps unitsByModule)
---          (fromMaybe [] $ M.lookup (mkPackage pkg) lookupByPkg)
---   return (allDeps, code)
+renameEntry :: MonadState CompactorState m
+            => Ident
+            -> m Ident
+renameEntry i = do
+  i'@(TxtI i'') <- renameVar i
+  addItem entries entries numEntries numEntries parentEntries i''
+  return i'
 
--- readObjectFile :: FilePath -> IO [ObjUnit]
--- readObjectFile = readObjectFileKeys (\_ _ -> True)
+renameVar :: MonadState CompactorState m
+          => Ident   -- ^ text identifier to rename
+          -> m Ident -- ^ the updated renamer state and the new ident
+renameVar i@(TxtI t)
+  | "h$$" `T.isPrefixOf` t = do
+      m <- use nameMap
+      case HM.lookup t m of
+        Just r  -> return r
+        Nothing -> do
+          y <- newIdent
+          nameMap %= HM.insert t y
+          return y
+  | otherwise = return i
 
--- readObjectFileKeys :: (Int -> [Text] -> Bool) -> FilePath -> IO [ObjUnit]
--- readObjectFileKeys p file = bracket (openBinaryFile file ReadMode) hClose $ \h -> do
---   mhdr <- getHeader <$> B.hGet h headerLength
---   case mhdr of
---     Left err -> error ("readObjectFileKeys: not a valid GHCJS object: " ++ file ++ "\n    " ++ err)
---     Right hdr -> do
---       bss <- B.hGet h (fromIntegral $ symbsLen hdr)
---       hSeek h RelativeSeek (fromIntegral $ depsLen hdr)
---       bsi <- B.fromStrict <$> BS.hGetContents h
---       return $ readObjectKeys' file p (getSymbolTable bss) bsi (B.drop (fromIntegral $ idxLen hdr) bsi)
+addItem :: (MonadState CompactorState m, HasDebugCallStack)
+        => Getting (HashMap Text Int) CompactorState (HashMap Text Int)
+        -> Setting (->)
+                   CompactorState
+                   CompactorState
+                   (HashMap Text Int)
+                   (HashMap Text Int)
+        -> Getting Int CompactorState Int
+        -> ASetter' CompactorState Int
+        -> Getting (HashMap Text Int) CompactorState (HashMap Text Int)
+        -> Text
+        -> m ()
+addItem items items' numItems numItems' parentItems i = do
+  s <- use items
+  case HM.lookup i s of
+    Just _ -> return ()
+    Nothing -> do
+      sp <- use parentItems
+      case HM.lookup i sp of
+        Just _  -> return ()
+        Nothing -> do
+          ni <- use numItems
+          items' %= HM.insert i ni
+          numItems' += 1
 
--- extractDeps :: Map (Package, Module) IntSet
---             -> Deps
---             -> DepsLocation
---             -> IO (Maybe (Package, Module, JStat, Text, [ClosureInfo], [StaticInfo], [ForeignRef]))
--- extractDeps units deps loc =
---   case M.lookup (pkg, mod) units of
---     Nothing       -> return Nothing
---     Just modUnits -> do
---       let selector n _  = n `IS.member` modUnits || isGlobalUnit n
---       x <- case loc of
---         ObjectFile js_o  -> collectCode =<< readObjectFileKeys selector js_o
---         ArchiveFile js_a -> collectCode =<<
---                             (readObjectKeys (js_a ++ ':':T.unpack mod) selector <$>
---                             Ar.readObject (mkModuleName $ T.unpack mod) js_a)
---         InMemory n b     -> collectCode $
---                             readObjectKeys n selector (BL.fromStrict b)
---       evaluate (rnf x)
---       return x
---   where
---     pkg           = depsPackage deps
---     mod           = depsModule deps
---     collectCode l = let x = ( pkg
---                             , mod
---                             , mconcat (map oiStat l)
---                             , T.unlines (map oiRaw l)
---                             , concatMap oiClInfo l
---                             , concatMap oiStatic l
---                             , concatMap oiFImports l)
---                     in evaluate (rnf x) >> return (Just x)
+collectLabels :: MonadState CompactorState m => StaticInfo -> m ()
+collectLabels si = mapM_ (addItem labels labels numLabels numLabels parentLabels)
+                         (labelsV . siVal $ si)
+  where
+    labelsV (StaticData _ args) = concatMap labelsA args
+    labelsV (StaticList args _) = concatMap labelsA args
+    labelsV _                   = []
+    labelsA (StaticLitArg l) = labelsL l
+    labelsA _                = []
+    labelsL (LabelLit _ lbl) = [lbl]
+    labelsL _                = []
+
+newIdent :: MonadState CompactorState m
+         => m Ident
+newIdent = do
+  yys <- use identSupply
+  case yys of
+    (y:ys) -> do
+      identSupply .= ys
+      return y
+    _ -> error "newIdent: empty list"
