@@ -40,8 +40,32 @@ executable ghcjs-ld
                       base64-bytestring,
                       mtl,
                       lens,
-                      split
+                      split,
+                      ghcjs-ld
 
     -- Directories containing source files.
     -- hs-source-dirs:
     default-language: Haskell2010
+
+library
+    hs-source-dirs:   src
+
+    exposed-modules:  GHCJS.Linker
+                      GHCJS.Linker.Compactor,
+                      GHCJS.Linker.Monad
+
+    build-depends:    base,
+                      ghcjs,
+                      text,
+                      optparse-applicative,
+                      deepseq,
+                      containers,
+                      bytestring,
+                      wl-pprint-text,
+                      parallel,
+                      unordered-containers,
+                      array,
+                      base64-bytestring,
+                      mtl,
+                      lens,
+                      split
