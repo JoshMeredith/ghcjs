@@ -48,12 +48,11 @@ import GHCJS.Linker.Monad
 
 data LinkCommand
    = LinkCommand
-   { output :: FilePath
-   , inputs :: [FilePath]
-   , paths  :: [FilePath]
-   , libs   :: [String]
-   , optsU  :: [String]
-   , optsr  :: [String]
+   { output      :: FilePath
+   , inputs      :: [FilePath]
+   , paths       :: [FilePath]
+   , libs        :: [String]
+   , relocatable :: Bool
    }
 
 data LinkError
@@ -70,21 +69,20 @@ verbosityOpt = (numerical <$> n) <|> quiet
 
 linkerSettings :: Parser (LinkerSettings, LinkCommand)
 linkerSettings = do
-  debug  <- switch (long "debug")
-  prof   <- switch (long "prof")
-  dedup  <- not <$> switch (long "no-dedupe")
-  inputs <- some (argument str (metavar "file..."))
   output <- strOption
               ( long "output"
              <> short 'o'
              <> value "link-output.js"
               )
+  debug  <- switch (long "debug")
+  prof   <- switch (long "prof")
+  dedup  <- not <$> switch (long "no-dedupe")
   verbose <- verbosityOpt
-  paths   <- many (option auto (short 'L'))
-  libs    <- many (option auto (short 'l'))
-  optsU   <- many (option auto (short 'U'))
-  optsr   <- many (option auto (short 'r'))
-  return $ (LinkerSettings debug prof dedup verbose, LinkCommand{output, inputs, paths, libs, optsU, optsr})
+  paths   <- many (option auto (short 'L' <> long "library" <> metavar "libname"))
+  libs    <- many (option auto (short 'l' <> long "library-path" <> metavar "searchdir"))
+  relocatable <- switch (short 'r' <> long "relocatable")
+  inputs <- some (argument str (metavar "file..."))
+  return (LinkerSettings debug prof dedup verbose, LinkCommand{output, inputs, paths, libs, relocatable})
 
 -- Setup and run the linking step - logging to console in verbose mode and displaying errors.
 link :: LinkerSettings -> LinkCommand -> IO ()
@@ -99,10 +97,9 @@ link set@LinkerSettings{lsVerbosity = verbose} comm = do
 
 -- Perform the linking step based on a `LinkCommand`.
 link' :: (Linker m, MonadIO m, MonadError LinkError m) => LinkCommand -> m ()
-link' command@LinkCommand{output, inputs, paths, libs, optsU, optsr} = do
-  whenM (verbosity Verbosity1) $ do
-    forM_ optsU $ \opt -> linkWarn $ T.concat ["Warning: unhandled 'U' option: ", T.pack opt]
-    forM_ optsr $ \opt -> linkWarn $ T.concat ["Warning: unhandled 'r' option: ", T.pack opt]
+link' command@LinkCommand{output, inputs, paths, libs, relocatable} = do
+  whenM (verbosity Verbosity1) $ when relocatable $
+    linkWarn "Warning: ignoring `-r`/`--relocatable` flag"
   libPaths <- getLibraries paths libs
   linkFiles output (inputs ++ libPaths)
 
