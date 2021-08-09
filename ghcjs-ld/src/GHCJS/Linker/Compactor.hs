@@ -45,7 +45,6 @@ import Gen2.Compactor (LinkedUnit, exprsE, exprsS, identsS, lookupRenamed, stati
 import GHCJS.Linker.Monad
 
 
-
 compact :: Linker m
         => [Text]
         -> [LinkedUnit]
@@ -261,7 +260,7 @@ renameInternals rtsDeps stats0a = do
             -- render metadata as individual statements
             meta = mconcat (map staticDeclStat statics) <>
                    (stbs & identsS %~ lookupRenamed cs) <>
-                   mconcat (map (staticInitStat $ prof) statics) <>
+                   mconcat (map (staticInitStat prof) statics) <>
                    mconcat (map (closureInfoStat True) infos)
         return (renamedStats, meta)
       | otherwise = do

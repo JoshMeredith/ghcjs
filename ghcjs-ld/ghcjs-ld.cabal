@@ -68,4 +68,8 @@ library
                       base64-bytestring,
                       mtl,
                       lens,
-                      split
+                      split,
+                      extra,
+                      transformers,
+                      directory,
+                      filepath
