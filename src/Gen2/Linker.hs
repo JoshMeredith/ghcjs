@@ -71,6 +71,7 @@ import           System.FilePath
 
 import System.IO
 
+import           System.Process
 import           System.Directory
   ( createDirectoryIfMissing, canonicalizePath
   , doesFileExist, getCurrentDirectory, copyFile)
@@ -119,6 +120,29 @@ data LinkResult = LinkResult
 
 instance Binary LinkResult
 
+invokeLinker :: Maybe FilePath
+             -> [FilePath]
+             -> [FilePath]
+             -> [String]
+             -> [Fun]
+             -> Maybe FilePath
+             -> IO ()
+invokeLinker outFile inFiles includePaths includes roots runM =
+  callProcess "ghcjs-ld" $ concat [ [ "-v3"
+                                    , outArg outFile
+                                    , runMain runM
+                                    ]
+                                  , inFiles
+                                  , concatMap libDirArg includePaths
+                                  , concatMap libArg    includes
+                                  , map rootArg roots
+                                  ]
+  where
+    outArg  = concat . fmap ("-o " ++)
+    runMain = concat . fmap ("--runMain " ++)
+    libDirArg  dir  = ["-L", show dir]
+    libArg     lib  = ["-l", show lib]
+    rootArg (Fun (Package p) m f) = T.unpack $ T.concat ["--root ", p, ".", m, ".", f]
 
 -- | link and write result to disk (jsexe directory)
 link :: DynFlags
@@ -135,6 +159,8 @@ link :: DynFlags
 link dflags env settings out include pkgs objFiles jsFiles isRootFun extraStaticDeps
   | gsNoJSExecutables settings = return ()
   | otherwise = do
+      createDirectoryIfMissing False out
+
       LinkResult lo lstats lmetasize lfrefs llW lla llarch lbase <-
         link' dflags env settings out include pkgs objFiles jsFiles
               isRootFun extraStaticDeps
@@ -142,7 +168,15 @@ link dflags env settings out include pkgs objFiles jsFiles isRootFun extraStatic
           jsExt | genBase   = "base.js"
                 | otherwise = "js"
       createDirectoryIfMissing False out
-      BL.writeFile (out </> "out" <.> jsExt) lo
+
+      -- BL.writeFile (out </> "out" <.> jsExt) lo
+      invokeLinker (Just (out </> "out" <.> jsExt))
+                   (map (\(ObjFile f) -> f) objFiles ++ jsFiles)
+                   (map (getInstalledPackageName dflags) pkgs)
+                   (concatMap (getInstalledPackageLibDirs dflags) pkgs)
+                   []
+                   Nothing
+
       unless (gsOnlyOut settings) $ do
         let frefsFile   = if genBase then "out.base.frefs" else "out.frefs"
             jsonFrefs  = Aeson.encode lfrefs
@@ -173,6 +207,52 @@ link dflags env settings out include pkgs objFiles jsFiles isRootFun extraStatic
                  writeRunner settings dflags out
                  writeWebAppManifest dflags out
                  writeExterns out
+
+      -- invokeLinker (Just $ out </> "all" <.> jsExt)
+      --              (map (\(ObjFile f) -> f) objFiles ++ jsFiles)
+      --              (map (getInstalledPackageName dflags) pkgs)
+      --              (concatMap (getInstalledPackageLibDirs dflags) pkgs)
+      --              undefined
+      --              undefined
+
+      -- LinkResult lo lstats lmetasize lfrefs llW lla llarch lbase <-
+      --   link' dflags env settings out include pkgs objFiles jsFiles
+      --         isRootFun extraStaticDeps
+      -- let genBase = isJust (gsGenBase settings)
+      --     jsExt | genBase   = "base.js"
+      --           | otherwise = "js"
+      -- createDirectoryIfMissing False out
+      -- BL.writeFile (out </> "out" <.> jsExt) lo
+      -- unless (gsOnlyOut settings) $ do
+      --   let frefsFile   = if genBase then "out.base.frefs" else "out.frefs"
+      --       jsonFrefs  = Aeson.encode lfrefs
+      --   BL.writeFile (out </> frefsFile <.> "json") jsonFrefs
+      --   BL.writeFile (out </> frefsFile <.> "js")
+      --                ("h$checkForeignRefs(" <> jsonFrefs <> ");")
+      --   unless (gsNoStats settings) $ do
+      --     let statsFile = if genBase then "out.base.stats" else "out.stats"
+      --     TL.writeFile (out </> statsFile) (linkerStats lmetasize lstats)
+      --   unless (gsNoRts settings) $ do
+      --     withRts <- mapM (tryReadShimFile dflags) llW
+      --     BL.writeFile (out </> "rts.js")
+      --       (TLE.encodeUtf8 rtsDeclsText <>
+      --        BL.fromChunks withRts <>
+      --        TLE.encodeUtf8 (rtsText' dflags $ dfCgSettings dflags))
+      --   lla'    <- mapM (tryReadShimFile dflags) lla
+      --   llarch' <- mapM (readShimsArchive dflags) llarch
+      --   BL.writeFile (out </> "lib" <.> jsExt)
+      --                (BL.fromChunks $ llarch' ++ lla')
+      --   if genBase
+      --     then generateBase out lbase
+      --     else when (not (gsOnlyOut settings) &&
+      --                not (gsNoRts settings) &&
+      --                not (usingBase settings)) $ do
+      --            combineFiles dflags out
+      --            writeHtml dflags out
+      --            writeRunMain dflags out
+      --            writeRunner settings dflags out
+      --            writeWebAppManifest dflags out
+      --            writeExterns out
 
 -- | link in memory
 link' :: DynFlags
@@ -320,11 +400,17 @@ convertPkg dflags p
  -}
 combineFiles :: DynFlags -> FilePath -> IO ()
 combineFiles dflags fp = do
-  files   <- mapM (B.readFile.(fp</>)) ["rts.js", "lib.js", "out.js"]
-  runMain <- if   gopt Opt_NoHsMain dflags
-             then pure mempty
-             else B.readFile (getLibDir dflags </> "runmain.js")
-  writeBinaryFile (fp</>"all.js") (mconcat (files ++ [runMain]))
+  let runMain = if   gopt Opt_NoHsMain dflags
+                then Nothing
+                else Just $ getLibDir dflags </> "runmain.js"
+  invokeLinker (Just $ fp </> "all.js")
+             (map (fp </>) ["rts.js", "lib.js", "out.js"])
+             [] [] [] runMain
+  -- files   <- mapM (B.readFile.(fp</>)) ["rts.js", "lib.js", "out.js"]
+  -- runMain <- if   gopt Opt_NoHsMain dflags
+  --            then pure mempty
+  --            else B.readFile (getLibDir dflags </> "runmain.js")
+  -- writeBinaryFile (fp</>"all.js") (mconcat (files ++ [runMain]))
 
 -- | write the index.html file that loads the program if it does not exit
 writeHtml :: DynFlags -> FilePath -> IO ()

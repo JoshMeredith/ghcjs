@@ -1,6 +1,7 @@
 {-# LANGUAGE
   ConstraintKinds,
   FlexibleContexts,
+  GeneralizedNewtypeDeriving,
   LambdaCase,
   OverloadedStrings
 #-}
@@ -8,16 +9,26 @@
 module GHCJS.Linker.Monad where
 
 import Control.Monad
+import Control.Monad.Except
+import Control.Monad.Extra
+import Control.Monad.Reader
+import Control.Monad.State.Strict
 import Control.Monad.RWS.Strict
 import Data.Functor.Identity
+import Data.String
 import Data.Text
-import Data.Text.IO
+import Data.Time.Clock
 import GHC.IO.Handle.FD (stdout, stderr)
+import System.IO
 
 import Gen2.Base
 
 
-data Verbosity = Quiet | Verbosity1 | Verbosity2 | Verbosity3 deriving (Eq, Ord)
+data Verbosity = Quiet | Verbosity1 | Verbosity2 | Verbosity3 deriving (Eq, Ord, Show)
+
+data LinkError
+   = MissingLibraries
+   | DependencyError
 
 data LinkerSettings
    = LinkerSettings
@@ -25,52 +36,69 @@ data LinkerSettings
    , lsProf   :: Bool
    , lsDedupe :: Bool
    , lsVerbosity :: Verbosity
+   , lsPhase  :: [String]
    }
 
-type Link = LinkT Identity
-type LinkT m = RWST LinkerSettings [Either Text Text] CompactorState m
+data LinkLog = LogMessage String | LogWarning String | LogError String
+
+newtype Link a = Link { getLinker :: ReaderT LinkerSettings (StateT CompactorState (ExceptT LinkError IO)) a }
+  deriving ( Functor
+           , Applicative
+           , Monad
+           , MonadIO
+           , MonadError LinkError
+           , MonadReader LinkerSettings
+           , MonadState CompactorState
+           )
 
 type Linker m = ( MonadReader LinkerSettings m
                 , MonadState CompactorState m
-                , MonadWriter [Either Text Text] m
+                , ConsoleLog m
                 )
 
+class ConsoleLog m where
+  logMessage :: String -> m ()
+  logWarning :: String -> m ()
+  logError   :: String -> m ()
+  phase      :: String -> m a -> m a
 
--- Run a `Link` monad, ignoring the log messages.
-runLinker :: Link a -> LinkerSettings -> a
-runLinker m = runIdentity . runLinkerT m
+instance ConsoleLog Link where
+  logMessage m = whenM (verbosity Verbosity1) . liftIO $ hPutStrLn stdout m
+  logWarning w = whenM (verbosity Verbosity1) . liftIO $ hPutStrLn stderr ("warning: " ++ w)
+  logError   e = whenM (verbosity Verbosity1) . liftIO $ hPutStrLn stderr ("error: " ++ e)
+  phase name m = local loc (ifM (verbosity Verbosity3) m' m)
+    where
+      loc r = r{lsPhase = name : lsPhase r}
 
--- Run a `LinkT` monad transformer, ignoring the log messages.
-runLinkerT :: Monad m => LinkT m a -> LinkerSettings -> m a
-runLinkerT m s = fst <$> evalRWST m s emptyCompactorState
+      m' = do
+        p       <- getPhase
+        liftIO $ putStrLn (">>> " ++ show p)
+        start   <- liftIO getCurrentTime
+        x       <- m
+        elapsed <- (`diffUTCTime` start) <$> liftIO getCurrentTime
+        liftIO $ putStrLn ("<<< " ++ show p ++ " complete in " ++ show elapsed)
+        return x
 
--- Run a `LinkT` monad transformer, then print it's log messages to the relevant stdout/stderr.
-consoleLinker :: MonadIO m => LinkT m a -> LinkerSettings -> m a
-consoleLinker m s = do
-  (a, messages) <- evalRWST (linkLog "testlog" >> linkWarn "testWarn" >> m) s emptyCompactorState
-  liftIO $ forM_ messages $ \case
-    Left  warn -> hPutStrLn stderr warn
-    Right log  -> hPutStrLn stdout log
-  return a
+runLinker :: Link a -> LinkerSettings -> IO (Either LinkError a)
+runLinker m s = runExceptT $ fmap fst (runStateT (runReaderT (getLinker m) s) emptyCompactorState)
 
 linkDebug :: MonadReader LinkerSettings m => m Bool
 linkDebug = lsDebug <$> ask
 
-linkProf  :: MonadReader LinkerSettings m => m Bool
+linkProf :: MonadReader LinkerSettings m => m Bool
 linkProf = lsProf <$> ask
 
 linkDedupe :: MonadReader LinkerSettings m => m Bool
 linkDedupe = lsDedupe <$> ask
 
--- Log a warning - to be sent to stderr.
-linkWarn :: MonadWriter [Either Text a] m => Text -> m ()
-linkWarn warn = tell [Left warn]
-
--- Log a message - to be sent to stdout.
-linkLog :: MonadWriter [Either a Text] m => Text -> m ()
-linkLog log = tell [Right log]
-
--- Is the setting verbosity at least the argument verbosity?
--- E.g. `whenM (verbosity Verbosity1) $ linkLog "..."`
 verbosity :: MonadReader LinkerSettings m => Verbosity -> m Bool
 verbosity v = (>= v) <$> (lsVerbosity <$> ask)
+
+getPhase :: MonadReader LinkerSettings m => m [String]
+getPhase = (Prelude.reverse . lsPhase) <$> ask
+
+exitLinker :: (Linker m, MonadError LinkError m) => LinkError -> m a
+exitLinker e = do
+  p <- getPhase
+  logError ("Linker failed in phase " ++ show p)
+  throwError e

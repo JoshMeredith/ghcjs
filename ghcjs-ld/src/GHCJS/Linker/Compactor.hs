@@ -28,6 +28,7 @@ import           Data.Text                 (Text)
 import qualified Data.Text                 as T
 
 -- GHC
+import Control.Monad.Extra
 import Util
 
 -- GHCJS
@@ -35,6 +36,7 @@ import Compiler.JMacro.Base
 import Compiler.JMacro.Combinators
 import Gen2.Base
 import Gen2.ClosureInfo
+import Gen2.Object
 import qualified Gen2.Utils as U
 import Gen2.Compactor (LinkedUnit, exprsE, exprsS, identsS, lookupRenamed, staticInfoArgs, dedupeBodies,
                        dedupe, renameStaticInfo, renameClosureInfo,
@@ -44,6 +46,21 @@ import Gen2.Compactor (LinkedUnit, exprsE, exprsS, identsS, lookupRenamed, stati
 -- GHCJS-LD
 import GHCJS.Linker.Monad
 
+
+linkObjects' :: Linker m => [ObjUnit] -> m ObjUnit
+linkObjects' (o:os) = foldM mergeObjs o os
+
+mergeObjs :: Linker m => ObjUnit -> ObjUnit -> m ObjUnit
+mergeObjs
+  o1@(ObjUnit sym1 info1 static1 stat1 raw1 fexports1 fimports1)
+  o2@(ObjUnit sym2 info2 static2 stat2 raw2 fexports2 fimports2)
+  = do
+    whenM (verbosity Verbosity3) . logMessage $ concat
+      ["Merging ", printJStatTag stat1, " with ", printJStatTag stat2]
+    return o1
+  where
+    printJStatTag BlockStat{} = "BlockStat"
+    printJStatTag _           = "OtherStat" 
 
 compact :: Linker m
         => [Text]
