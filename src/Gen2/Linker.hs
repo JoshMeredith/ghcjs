@@ -74,6 +74,7 @@ import System.IO
 import           System.Directory
   ( createDirectoryIfMissing, canonicalizePath
   , doesFileExist, getCurrentDirectory, copyFile)
+import           System.Process
 import           Text.PrettyPrint.Leijen.Text (displayT, renderPretty)
 
 import           Compiler.Compat
@@ -119,6 +120,31 @@ data LinkResult = LinkResult
 
 instance Binary LinkResult
 
+invokeLinker :: Maybe FilePath
+             -> Bool
+             -> [FilePath]
+             -> [FilePath]
+             -> [String]
+             -> [Fun]
+             -> Maybe FilePath
+             -> IO ()
+invokeLinker outFile relocatable inFiles includePaths includes roots runM =
+  callProcess "ghcjs-ld" $ concat [ [ "-v3"
+                                    , if relocatable then "-r" else ""
+                                    ]
+                                  , outArg outFile
+                                  , runMain runM
+                                  , inFiles
+                                  , concatMap libDirArg includePaths
+                                  , concatMap libArg    includes
+                                  , concatMap rootArg roots
+                                  ]
+  where
+    outArg  = concat . fmap (\o -> ["-o", o])
+    runMain = concat . fmap (\r -> ["--runMain", r])
+    libDirArg  dir  = ["-L", show dir]
+    libArg     lib  = ["-l", show lib]
+    rootArg (Fun (Package p) m f) = ["--root", T.unpack $ T.concat [p, ".", m, ".", f]]
 
 -- | link and write result to disk (jsexe directory)
 link :: DynFlags
@@ -142,7 +168,16 @@ link dflags env settings out include pkgs objFiles jsFiles isRootFun extraStatic
           jsExt | genBase   = "base.js"
                 | otherwise = "js"
       createDirectoryIfMissing False out
-      BL.writeFile (out </> "out" <.> jsExt) lo
+      -- BL.writeFile (out </> "out" <.> jsExt) lo
+
+      invokeLinker (Just (out </> "out" <.> jsExt))
+                   False
+                   (map (\(ObjFile f) -> f) objFiles ++ jsFiles)
+                   (map (getInstalledPackageName dflags) pkgs)
+                   (concatMap (getInstalledPackageLibDirs dflags) pkgs)
+                   []
+                   Nothing
+
       unless (gsOnlyOut settings) $ do
         let frefsFile   = if genBase then "out.base.frefs" else "out.frefs"
             jsonFrefs  = Aeson.encode lfrefs
@@ -320,11 +355,12 @@ convertPkg dflags p
  -}
 combineFiles :: DynFlags -> FilePath -> IO ()
 combineFiles dflags fp = do
-  files   <- mapM (B.readFile.(fp</>)) ["rts.js", "lib.js", "out.js"]
-  runMain <- if   gopt Opt_NoHsMain dflags
-             then pure mempty
-             else B.readFile (getLibDir dflags </> "runmain.js")
-  writeBinaryFile (fp</>"all.js") (mconcat (files ++ [runMain]))
+  let runMain = if   gopt Opt_NoHsMain dflags
+                then Nothing
+                else Just $ getLibDir dflags </> "runmain.js"
+  invokeLinker (Just $ fp </> "all.js") False
+               (map (fp </>) ["rts.js", "lib.js", "out.js"])
+               [] [] [] runMain
 
 -- | write the index.html file that loads the program if it does not exit
 writeHtml :: DynFlags -> FilePath -> IO ()

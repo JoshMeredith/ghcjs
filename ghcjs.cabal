@@ -138,8 +138,36 @@ Library
                      Compiler.JMacro.Combinators,
                      Compiler.JMacro.Symbols,
                      GHCJS
+
     other-modules: Paths_ghcjs
     autogen-modules: Paths_ghcjs
+
+    -- ghcjs-ld:
+    exposed-modules: GHCJS.Linker,
+                     GHCJS.Linker.Compactor,
+                     GHCJS.Linker.Monad
+    
+    -- ghcjs-ld:
+    build-depends:   base,
+                     text,
+                     optparse-applicative,
+                     deepseq,
+                     containers,
+                     bytestring,
+                     wl-pprint-text,
+                     parallel,
+                     unordered-containers,
+                     array,
+                     base64-bytestring,
+                     mtl,
+                     lens,
+                     split,
+                     extra,
+                     transformers,
+                     directory,
+                     filepath,
+                     time,
+                     multimap
 
     if os(windows)
         hs-source-dirs: src-platform/windows
@@ -821,6 +849,14 @@ Executable ghcjs
     Build-Depends:  base                >= 4    &&  < 5,
                     ghcjs
     GHC-Options:    -rtsopts -with-rtsopts=-N -with-rtsopts=-K1024m -threaded -fprof-auto-calls
+
+Executable ghcjs-ld
+    Main-Is:        Ld.hs
+    Default-Language: Haskell2010
+    hs-source-dirs: src-bin
+    Build-Depends:  base,
+                    ghcjs,
+                    optparse-applicative
 
 -- the package manager, like with the compiler, this executable is called
 -- through a wrapper script

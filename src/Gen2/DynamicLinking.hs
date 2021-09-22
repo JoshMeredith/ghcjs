@@ -53,6 +53,7 @@ import           SysTools
 import qualified Data.Yaml                as Yaml
 import Compiler.Info (getLibDir)
 import Gen2.Archive
+import Gen2.Linker (invokeLinker)
 
 
 -------------------------------------------------------------------------------------------
@@ -95,16 +96,22 @@ ghcjsLinkJsLib settings jsFiles dflags hpt
                   (gsJsLibOutputDir settings `mplus` objectDir dflags)
           outputFile     = inOutputDir libFileName
           jsFiles' = nub (gsJsLibSrcs settings ++ jsFiles)
-          meta    = Meta (opt_P dflags)
-      jsEntries <- forM jsFiles' $ \file ->
-        (JsSource file,) . B.fromStrict <$> BS.readFile file
-      objEntries <- forM (eltsUDFM hpt) $ \hmi -> do
+          -- meta    = Meta (opt_P dflags)
+      -- jsEntries <- forM jsFiles' $ \file ->
+      --   (JsSource file,) . B.fromStrict <$> BS.readFile file
+      -- objEntries <- forM (eltsUDFM hpt) $ \hmi -> do
+      --   let mt    = T.pack . moduleNameString . moduleName . mi_module . hm_iface $ hmi
+      --       files = maybe [] (\l -> [ o | DotO o <- linkableUnlinked l]) (hm_linkable hmi)
+      --   -- fixme archive does not handle multiple files for a module yet
+      --   forM files $ \file ->
+      --     (Object mt,) . B.fromStrict <$> BS.readFile file
+
+      oFiles <- fmap concat <$> forM (eltsUDFM hpt) $ \hmi -> do
         let mt    = T.pack . moduleNameString . moduleName . mi_module . hm_iface $ hmi
-            files = maybe [] (\l -> [ o | DotO o <- linkableUnlinked l]) (hm_linkable hmi)
-        -- fixme archive does not handle multiple files for a module yet
-        forM files $ \file ->
-          (Object mt,) . B.fromStrict <$> BS.readFile file
-      B.writeFile outputFile (buildArchive meta (concat objEntries ++ jsEntries))
+        return $ maybe [] (\l -> [ o | DotO o <- linkableUnlinked l]) (hm_linkable hmi)
+
+      -- B.writeFile outputFile (buildArchive meta (concat objEntries ++ jsEntries))
+      invokeLinker (Just outputFile) True (jsFiles' ++ oFiles) [] [] [] Nothing
       -- we don't use shared js_so libraries ourselves, but Cabal expects that we
       -- generate one when building with --dynamic-too. Just write an empty file
       when (gopt Opt_BuildDynamicToo dflags || WayDyn `elem` ways dflags) $ do
